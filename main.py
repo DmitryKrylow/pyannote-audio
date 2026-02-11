@@ -1,5 +1,6 @@
 import os
 import tempfile
+import subprocess
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.utils.hook import ProgressHook
@@ -13,34 +14,52 @@ MODEL_ID = os.getenv("PYANNOTE_MODEL_ID", "pyannote/speaker-diarization-communit
 HF_TOKEN = os.getenv("HF_TOKEN")
 DEVICE = os.getenv("PYANNOTE_DEVICE", "cpu")
 MERGE_GAP = float(os.getenv("PYANNOTE_MERGE_GAP", "0.5"))
-TMP_SUFFIX = os.getenv("PYANNOTE_SUFFIX", ".wav")
 
 if not HF_TOKEN:
-    raise RuntimeError("Переменная окружения HF_TOKEN не задана (в .env или окружении).")
+    raise RuntimeError("HF_TOKEN не задан в .env или окружении.")
 
 pipeline = Pipeline.from_pretrained(MODEL_ID, token=HF_TOKEN)
-
 try:
     pipeline.to(DEVICE)
 except Exception:
     pass
 
 
+def ffmpeg_to_wav_48k_mono(src_path: str, dst_path: str) -> None:
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src_path,
+        "-ac", "1",
+        "-ar", "48000",
+        "-c:a", "pcm_s16le",
+        dst_path,
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {p.stderr[-2000:]}")
+
 @app.post("/diarize")
 async def diarize_audio(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Файл не передан.")
 
-    with tempfile.NamedTemporaryFile(suffix=TMP_SUFFIX, delete=True) as tmp:
-        contents = await file.read()
-        if not contents:
-            raise HTTPException(status_code=400, detail="Пустой файл.")
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Пустой файл.")
 
-        tmp.write(contents)
-        tmp.flush()
+    with tempfile.NamedTemporaryFile(suffix=".input", delete=True) as tmp_in, \
+         tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp_wav:
+
+        tmp_in.write(contents)
+        tmp_in.flush()
+
+        try:
+            ffmpeg_to_wav_48k_mono(tmp_in.name, tmp_wav.name)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Не удалось декодировать аудио: {e}")
 
         with ProgressHook() as hook:
-            diarization = pipeline(tmp.name, hook=hook)
+            diarization = pipeline(tmp_wav.name, hook=hook)
 
         merged_result = []
         previous = None
